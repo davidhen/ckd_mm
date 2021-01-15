@@ -8,8 +8,6 @@ output:
     code_folding: hide
     toc: true
     toc_float: true
-    df_print: paged
-    keep_md: true
 ---
 
 ```{r setup, include=FALSE}
