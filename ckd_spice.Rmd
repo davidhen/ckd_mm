@@ -1,0 +1,890 @@
+---
+title: "CKD Multimorbidity"
+date: "28/05/2020"
+output: 
+  html_document:
+    theme: journal
+    highlight: haddock
+    code_folding: hide
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+options(scipen = 9)
+```
+
+# Preamble
+
+This document details the code used to analyse the data for the paper "Paper title in here" in the following sections. 
+
+1. Preliminaries:          Load required packages and helper functions
+2. Import and clean:       Import the data and clean ready for analysis  
+3. Descriptive Statistics: First look at data description
+4. Models:                 Fit models for designated variables on outcome  
+5. Join:                   Combine baseline descriptive stats with main model output data
+6. Outputs:                Tables 1 to 3 and Figures 1 to 7a
+7. Session Information:    Print all software used in session.
+
+
+# Preliminaries
+
+## Packages
+
+Load in the required packages and set baseline plotting parameters. Non-CRAN packages marked with an *. Source for all provided in session information at the end of this document
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(finalfit)
+library(phsmethods) #*
+library(broom)
+library(here)
+library(janitor)
+library(socviz)     
+library(glue)
+library(ComplexUpset) #*
+library(ggrepel)
+library(tidylo)
+library(tidytext)
+
+#Helper function to provide opposite of %in%
+`%nin%` <- negate(`%in%`)
+#Short cut for csv output with html tables
+my_datatable <- function(x){
+  DT::datatable(x, extensions = "Buttons", options = list(dom = "Bfrtip", 
+                                                          buttons = c("csv")))
+}
+
+#Base plotting options
+theme_set(theme_minimal(base_family = "IBMPlexSans", base_size = 16) +
+            theme(panel.grid.minor = element_blank(),
+                  axis.title.y = element_text(margin = margin(0, 20, 0, 0)),
+                  axis.title.x = element_text(margin = margin(20, 0, 0, 0))))
+
+#Custom colour scheme
+colours_ckd <- c("#e53935", "#3949ab", "#8e24aa", "#039be5", "#00897b",
+                 "#7cb342", "#fdd835", "#fb8c00", "#6d4c41", "#546e7a")
+```
+
+# Import and clean data
+
+The original data is provided as a SPSS `.sav` file. This can be loaded in but requires some cleaning. Code below is commented to identify what is being done on each command
+
+```{r}
+# Create new object called "spice"
+spice <- 
+  # read in from project data folder
+  haven::read_sav(here("data/MM_LIVING_WELL_FINAL_DATASET_APRIL_2011.sav")) %>% 
+  #Use janitor package to convert variable names to snake_case
+  clean_names() %>% 
+  #Drop unneeded variables
+  select(-practice_id:-date_registered, -age_group:-age65, -carstairs_depcat:-qof_two_or_more,
+         -filter) %>% 
+  #Reorder variables so that Mental health variables listed first
+  select(unique_patient_id:carstairs_decile, ckd, dementia, mental_alcohol, mental_psycho,
+         learning_disability, anorexia, depression, schiz_bipolar, anxiety, everything()) %>%
+  #Drop those under the age of 25
+  filter(age >= 25) %>% 
+  #Now count a) all morbidities, b)mental health morbs, c)physical health morbs
+  #Easy to do by row counting relevant columns. These counts *exclude* CKD
+  #And so are a count of CKD co-morbidity
+  mutate(all_morbidities_count = rowSums(.[7:45]),
+         mental_morbidities_count = rowSums(.[7:14]),
+         physical_morbidities_count = rowSums(.[15:45]),
+         all_morbidities = factor(all_morbidities_count),
+         #Now create a factor version of each of the counts and specify labels
+         all_morbidities = fct_collapse(all_morbidities,
+                                         `0` = "0",
+                                         `1-3` = c("1", "2", "3"),
+                                         `4-6` = c("4", "5", "6"),
+                                         other_level = ">=7"),
+         physical_morbidities = factor(physical_morbidities_count),
+         physical_morbidities = fct_collapse(physical_morbidities,
+                                      `0` = "0",
+                                      `1-3` = c("1", "2", "3"),
+                                      `4-6` = c("4", "5", "6"),
+                                      other_level = ">=7"),
+         mental_morbidities = factor(mental_morbidities_count),
+         mental_morbidities = fct_collapse(mental_morbidities,
+                                      `0` = "0",
+                                      `1-3` = c("1", "2", "3"),
+                                      other_level = ">=4"),
+         #Coerce sex variable to a factor and label
+         sex = factor(sex, levels = c("0","1"),
+                      labels = c("Female", "Male")),
+         #Calculate age groups using phsmethods package and age_group()function
+         age_group = age_group(age, from = 25, to = 85, by = 10),
+         #Explicitly specify the factor levels for accuracy
+         age_group = factor(age_group,
+                            levels = c("25-34", "35-44", "45-54", "55-64", "65-74", "75-84",
+                                       "85+")),
+         #Factorise deprivation deciles
+         carstairs_decile = factor(carstairs_decile),
+         carstairs_decile = fct_inseq(carstairs_decile),
+         #Important that main outcome variable is levelled as "failure" and
+         #then "success" as per glm() models used later
+         ckd = factor(ckd, levels = c(0, 1),
+                      labels = c("No CKD", "CKD"))) %>%
+  #All 39 other disease variables are now factorised
+  mutate_at(vars(dementia:pain), ~factor(., levels = c("1", "0"),
+                                     labels = c("Yes", "No"))) %>% 
+  #rearrange variable order again
+  select(unique_patient_id, sex, age, age_group, carstairs_score:ckd, all_morbidities,
+         all_morbidities_count, physical_morbidities, physical_morbidities_count,
+         mental_morbidities, mental_morbidities_count, everything())
+  
+```
+
+
+# Descriptive stats
+
+
+The `finalfit` package provides a simple way of printing a basic "Table 1" using the `summary_factorlist()` function. This won't be the final table 1 but used as the foundation. Additional cleaning added in order to allow this table to be joined to other results later.
+
+```{r}
+#Create vector of all variable names
+spice_names <- names(spice)
+#Define dependent variable
+dependent <- "ckd"
+#Define explanatory variables by subsetting the spice_names vector to  exclude the ID and CKD #variables
+explanatory <- c(spice_names[spice_names %nin% c("unique_patient_id", "ckd")])
+
+#Create the table
+tab_1 <- 
+  spice %>% 
+  summary_factorlist(dependent, explanatory, add_col_totals = TRUE,
+                     include_col_totals_percent = TRUE) %>% 
+  #Coerce back to tidy object
+  as_tibble() %>% 
+  #Drop negative levels for diseases
+  filter(levels %nin% "No") %>% 
+  #Repeat label names in each group - this will enable joining to other tables later
+  mutate(label = na_if(label, ""),
+         label = zoo::na.locf(label))
+
+tab_1
+```
+
+
+# Models
+
+Logistic regression models are used with presence of CKD (Yes/No) as the outcome variable. We fit unadjusted models for all variables of interest (age group, sex, deprivation decile, morbidity groups, and presence of each of the other 39 diseases in the dataset), and models adjusted for age (continuous), sex, and deprivation score (continuous). 
+
+A total of 92 models are fitted. Adjusted models for Age, Sex, and deprivation are adjusted only for the two other demographic groups e.g. Sex is adjusted for age and deprivation.
+
+In order to complete this efficiently and collate results tidily, a data frame containing each of the independent variable names is created below...
+
+```{r}
+model_tab <- 
+  tibble(label = spice_names[spice_names %nin% c("unique_patient_id", "ckd")])
+model_tab
+```
+
+Two functions are now defined, one for fitting a univariate logistic regression model with the argument `x` used to denote the independent variable. The second is a helper function to save typing repetition when extracting model results. 
+
+
+```{r}
+model_uni <- function(x){
+  glm(as.formula(paste("ckd ~",x)), family = binomial, data = spice)
+}
+
+
+mm_tidy <- function(df, mod_type = tidy_mod_multi){
+  mod_type <- enquo(mod_type)
+  
+  df %>%
+    #drop unneeded columns from model output
+    select(label, !!mod_type) %>% 
+    #unnest the model results
+    unnest(!!mod_type) %>% 
+    #calculate odds-ratio and 95% CIs
+    mutate(or = exp(estimate),
+           conf_low = exp(estimate - 1.96*std.error),
+           conf_hi = exp(estimate + 1.96*std.error)) %>%
+    #tidy column order
+    select(label, levels = term, or, conf_low, conf_hi, everything()) %>% 
+    #round to 2 significant figures
+    round_df(dig = 2) -> x
+  
+  return(x)
+    
+}
+```
+
+
+## Sex
+
+The first models are fitted with sex as independent variable. As the adjusted model cannot include sex a separate adjusted model function is created for sex. Both models are then run with sex as independent variable and model objects appended as list columns to `model_tab`. The previously defined `mm_tidy()` function is then used to extract model results. Finally, the unadjusted and adjusted models results are joined together.
+
+
+```{r, warning=FALSE, message=FALSE}
+#Define adjusted model for sex
+sex_model_multi <- function(x){
+  glm(as.formula(paste("ckd ~",x,"+ age + carstairs_score")), family = binomial, data = spice)
+}
+
+#fit unadjusted and adjusted models, then extract results with broom::tidy()
+#all results stored in new list columns
+model_tab %>% 
+  filter(label %in% "sex") %>% 
+  mutate(model_uni = map(label, ~model_uni(.x)),
+         model_multi = map(label, ~sex_model_multi(.x)),
+         tidy_mod_uni = map(model_uni, tidy),
+         tidy_mod_multi = map(model_multi, tidy)) -> sex_mod
+
+#run the previously defined function to extract results and calculate
+#ORs with CIs from adjusted model
+sex_mod %>% 
+  mm_tidy() %>% 
+  #drop the reference level
+  filter(levels %in% "sexMale") %>%
+  #tidy labels and add prefix to indicated these are adjusted results
+  mutate(levels = str_replace(levels,"sex", "")) %>% 
+  rename_at(vars(or:p.value), ~paste0("adj_", .)) -> sex_mod_multi
+
+#repeat above but for the unadjusted model
+sex_mod %>% 
+  mm_tidy(., mod_type = tidy_mod_uni) %>% 
+  filter(levels %in% "sexMale") %>% 
+  mutate(levels = str_replace(levels,"sex", "")) %>% 
+  rename_at(vars(or:p.value), ~paste0("unadj_", .)) -> sex_mod_uni
+
+#Join adjusted and unadjusted results together
+sex_mod_all <- left_join(sex_mod_uni, sex_mod_multi) 
+
+#Drop intermediary objects from memory
+rm(list = c("sex_mod", "sex_mod_multi", "sex_mod_uni"))
+sex_mod_all
+```
+
+
+## Age
+
+The above process for Sex is now repeated for Age groups. An important point here is that the reference group is changed to be 45-54 which includes the mean and median ages for all the observations in the data.  
+
+```{r, warning=FALSE, message=FALSE}
+#Change reference group to 45-54
+spice %<>%
+  mutate(age_group = fct_relevel(age_group, "45-54"))
+
+#Define function for adjusted model for age group
+age_model_multi <- function(x){
+  glm(as.formula(paste("ckd ~ ",x,"+ sex + carstairs_score")), family = binomial,  data = spice)
+}
+
+#Fit models and tidy
+model_tab %>% 
+  filter(label %in% "age_group") %>% 
+  mutate(model_uni = map(label, ~model_uni(.x)),
+         model_multi = map(label, ~age_model_multi(.x)),
+         tidy_mod_uni = map(model_uni, tidy),
+         tidy_mod_multi = map(model_multi, tidy)) -> age_mod
+
+#Extract and tidy adjusted model results
+age_mod %>% 
+  mm_tidy() %>%  
+  filter(levels %nin% c("(Intercept)", "sexMale", "carstairs_score")) %>% 
+  mutate(levels = str_replace(levels, "age_group", "")) %>% 
+  rename_at(vars(or:p.value), ~paste0("adj_", .)) -> age_mod_multi
+
+#Extract and tidy unadjusted results
+age_mod %>% 
+  mm_tidy(., tidy_mod_uni) %>% 
+  filter(levels %nin% c("(Intercept)", "sexMale", "carstairs_score")) %>% 
+  mutate(levels = str_replace(levels, "age_group", "")) %>% 
+  rename_at(vars(or:p.value), ~paste0("unadj_", .)) -> age_mod_uni
+
+#Join age group models together
+age_mod_all <- left_join(age_mod_uni, age_mod_multi) 
+
+#Drop intermediary objects
+rm(list = c("age_mod", "age_mod_multi", "age_mod_uni"))
+age_mod_all
+```
+
+
+## Deprivation
+
+The final bespoke set of models is for deprivation adjusting for sex and age (results not printed)
+
+```{r, warning=FALSE, message=FALSE}
+#Define adjusted model for deprivation
+dep_model_multi <- function(x){
+  glm(as.formula(paste("ckd ~",x,"+ sex + age")),
+      family = binomial,
+      data = spice)
+}
+
+#Fit and tidy models
+model_tab %>% 
+  filter(label %in% "carstairs_decile") %>% 
+  mutate(model_uni = map(label, ~model_uni(.x)),
+         model_multi = map(label, ~dep_model_multi(.x)),
+         tidy_mod_uni = map(model_uni, tidy),
+         tidy_mod_multi = map(model_multi, tidy)) -> dep_mod
+
+#Extract and tidy adjusted model results
+dep_mod %>% 
+  mm_tidy  %>% 
+  filter(levels %nin% c("(Intercept)", "sexMale", "sexFemale", "age")) %>% 
+  mutate(levels = str_replace(levels, "carstairs_decile", "")) %>% 
+  rename_at(vars(or:p.value), ~paste0("adj_", .)) -> dep_mod_multi
+
+#Extract and tidy unadjusted model results
+dep_mod %>% 
+  mm_tidy(., tidy_mod_uni) %>% 
+  filter(levels %nin% c("(Intercept)", "sexMale", "sexFemale", "age")) %>% 
+  mutate(levels = str_replace(levels, "carstairs_decile", "")) %>% 
+  rename_at(vars(or:p.value), ~paste0("unadj_", .)) -> dep_mod_uni
+
+#Join deprivation model results together
+dep_mod_all <- left_join(dep_mod_uni, dep_mod_multi) 
+
+#Drop intermediary objects from memory
+rm(list = c("dep_mod", "dep_mod_multi", "dep_mod_uni"))
+#results not printed
+```
+
+
+
+## All other models
+
+
+The remaining 84 models can be run with one chunk of code as the adjusted model is the same for each variable of interest: all co-morbidity grouped count, all physical co-morbidity grouped count, all mental health co-morbidity grouped count, and each of the other 39 diseases. This chunk takes ~6mins to run with 1.7GHz Quad Core Intel i7 processor and 16GB LPDDR3 RAM (results not printed).
+
+```{r, warning=FALSE, message=FALSE}
+#Define function for adjusted model
+model_multi <- function(x){
+  glm(as.formula(paste("ckd ~",x,"+ age + sex + carstairs_score")), family = binomial, data = spice)
+}
+
+#Relevel all of the disease variables so "No" is reference
+spice %<>% 
+  mutate_at(vars(dementia:pain), ~fct_relevel(.x, "No"))
+
+#Fit and tidy the models
+model_tab %>% 
+  filter(label %nin% c("unique_patient_id",  "age", "age_group", "sex", "carstairs_score",
+                       "carstairs_decile", "ckd")) %>% 
+  mutate(model_uni = map(label, ~model_uni(.x)),
+         model_multi = map(label, ~model_multi(.x)),
+         tidy_mod_uni = map(model_uni, tidy),
+         tidy_mod_multi = map(model_multi, tidy)) -> other_mod
+
+#Extract and tidy adjusted model results
+other_mod %>% 
+  mm_tidy() %>% 
+  filter(levels %nin% c("(Intercept)", "sexMale", "carstairs_score", "age"))%>% 
+  mutate(levels = str_replace(levels,"all_morbidities", ""),
+         levels = str_replace(levels, "physical_morbidities", ""),
+         levels = str_replace(levels, "mental_morbidities", ""),
+         levels = str_replace(levels, "Yes", "")) %>% 
+  rename_at(vars(or:p.value), ~paste0("adj_", .)) -> other_mod_multi
+
+#Extract and tidy unadjusted model results
+other_mod %>% 
+  mm_tidy(., tidy_mod_uni) %>% 
+  filter(levels %nin% c("(Intercept)", "sexMale", "carstairs_score", "age"))%>% 
+  mutate(levels = str_replace(levels,"all_morbidities", ""),
+         levels = str_replace(levels, "physical_morbidities", ""),
+         levels = str_replace(levels, "mental_morbidities", ""),
+         levels = str_replace(levels, "Yes", "")) %>% 
+  rename_at(vars(or:p.value), ~paste0("unadj_", .)) -> other_mod_uni
+
+#Join and tidy adjusted and unadjusted results
+other_mod_all <- left_join(other_mod_uni, other_mod_multi) %>% 
+  mutate(levels = case_when(
+    levels %in% c("1-3", "4-6", ">=7", ">=4") ~ levels,
+    TRUE ~ "Yes"
+  ))
+
+#remove intermediary objects
+rm(list = c("other_mod", "other_mod_multi", "other_mod_uni"))
+
+#results not printed
+```
+
+## Join Descriptive and Model Tables: Table S1
+
+Here the results of the models are combined with base table created above in the Descriptive stats section. Odds ratio and associated results are added to rows for each variable with some tidying of labels. New variables are created that paste together results of OR with CIs for easier printing in final tables. P-values are only included in they are >0.05
+
+This contains complete results and extra information suitable for supplementary material. Main paper table will be created below. All variables can be viewed by clicking the small `>` button on the top row of the table. 
+
+
+```{r}
+final_tab <- 
+  #Combine model result tables
+  bind_rows(sex_mod_all, age_mod_all, dep_mod_all, other_mod_all) %>% 
+  #Join to base table
+  left_join(tab_1, ., by = c("label", "levels")) %>% 
+  #coerce non-sig p-value to NA
+  mutate(unadj_p.value = if_else(unadj_p.value < 0.05, NA_real_, unadj_p.value),
+         #Coerce p value column to character
+         unadj_p.value = as.character(unadj_p.value),
+         #Conditionally add label if p>0.05
+         unadj_p.value = if_else(!is.na(unadj_p.value),
+                                 paste0("p = ", unadj_p.value), unadj_p.value),
+         #repeat for adjusted model p values
+         adj_p.value = if_else(adj_p.value < 0.05, NA_real_, adj_p.value),
+         adj_p.value = as.character(adj_p.value),
+         adj_p.value = if_else(!is.na(adj_p.value), paste0("p = ", adj_p.value), adj_p.value),
+         #Create result label column for unadjusted models
+         unadj_label = 
+           glue("{unadj_or} ({unadj_conf_low} to {unadj_conf_hi}) {unadj_p.value}", .na = ""),
+         #tidy blank space
+         unadj_label = str_replace(unadj_label, "\\( to \\)", ""),
+         #Repeat for unadjusted model
+         adj_label = 
+           glue("{adj_or} ({adj_conf_low} to {adj_conf_hi}) {adj_p.value}", .na = ""),
+         adj_label = str_replace(adj_label, "\\( to \\)", ""),
+         #Change main lables to title case
+         label = snakecase::to_any_case(label, "title"),
+         #Fix those that fall through the net - abbreviations!
+         label = str_replace(label, "Chd", "CHD"),
+         label = str_replace(label, "Pvd", "PVD"),
+         label = str_replace(label, "Tia Stroke", "TIA/Stroke"),
+         label = str_replace(label, "Ibs", "IBS"),
+         label = str_replace(label, "Ms", "MS")) %>% 
+  #Reorder columns
+  select(label, levels, `No CKD`, CKD, unadj_label, adj_label, unadj_or:unadj_conf_hi, 
+         unadj_p.value, adj_or:adj_conf_hi, adj_p.value, everything())
+  
+#Remove disease rows and reorder by adjusted OR
+final_tab %>% 
+  filter(levels == "Yes") %>% 
+  arrange(-adj_or) -> ordered_morbs
+#Drop diseases from main tab then rejoin with ordered rows
+final_tab %<>% 
+  filter(levels != "Yes") %>% 
+  bind_rows(., ordered_morbs)
+final_tab
+
+# Add DT for csv
+```
+
+# Outputs
+
+## Table 1
+
+Use the table created above but keep only Demographic variables and model label columns. Note: clicking the `CSV` button will automatically download this table as csv to your machine.
+
+
+```{r}
+final_tab %>% 
+  filter(label %in% c("Total n", "Sex", "Age", "Age Group", "Carstairs Decile")) %>% 
+  select(label, levels, `No CKD`, CKD, unadj_label, adj_label) %>% 
+  my_datatable(.)
+```
+
+
+## Figure 1 (optional)
+
+Adjusted odds-ratios from table 1 are visualised here. May be of interest given weaker association shown for deprivation.
+
+```{r, fig.width=12, fig.height=9}
+final_tab %>% 
+  filter(label %in% c("Sex", "Age Group",
+                      "Carstairs Decile")) %>% 
+  filter(levels != "Female") %>% 
+  mutate(levels = factor(levels,
+                         levels = c("Male", "25-34", "35-44", "45-54", "55-64", "65-74", "75-84",
+                                    "85+", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"),
+                         labels = c("Male (ref Female)", "Age Group: 25-34", "35-44", "45-54 (ref)",
+                                    "55-64", "65-74", "75-84", "85+", "Deprivation Decile 1 (ref)",
+                                    "2", "3", "4", "5", "6", "7", "8", "9", 
+                                    "10 - most deprived"))) %>% 
+  ggplot(aes(fct_rev(levels), adj_or)) +
+  geom_hline(yintercept = 1) +
+  geom_point() +
+  geom_errorbar(aes(ymin = adj_conf_low, ymax = adj_conf_hi)) +
+  scale_y_log10(breaks = scales::log_breaks(n = 6)) +
+  scale_colour_manual(values = colours_ckd) +
+  theme(legend.position = "top",
+        text = element_text(size = 16),
+        axis.text.y = element_text(margin = margin(t = 50, b = 50))) +
+  coord_flip() +
+  labs(y = "Odds Ratio with 95% CI\n(log scale)",
+       x = "",
+       title = "Odds ratios for demographics in relation to CKD status",
+       colour = "Morbidity type",
+       caption = "CKD group = 33,567\nNon-CKD group = 1,240,807\nAll ORs adjusted for other present demographics\ne.g. Sex adjusted for age and deprivation") -> fig_1
+fig_1
+```
+
+```{r, eval=FALSE, echo=FALSE}
+ggsave("plots/fig_1.png", fig_1, width = 12, height = 9, dpi = 300)
+```
+
+## Table 2
+
+Results of models for grouped disease counts.
+
+```{r}
+final_tab %>% 
+  filter(label %in% c("All Morbidities", "Physical Morbidities", "Mental Morbidities")) %>% 
+  select(label, levels, `No CKD`, CKD, unadj_label, adj_label) %>% 
+  my_datatable(.)
+```
+
+
+## Figure 2
+
+There are 39 diseases, difficult to show in a table so visualisation is better. Those wanting exact figures can refer to table S1 above. 
+
+```{r, fig.width=12, fig.height=9}
+final_tab %>% 
+  filter(label %nin% c("Total n", "Sex", "Age", "Age Group", "Carstairs Decile", 
+                       "All Morbidities", "Physical Morbidities", "Mental Morbidities", 
+                       "Carstairs Score", "Physical Morbidities Count", "Mental Morbidities Count", 
+                       "All Morbidities Count")) %>% 
+  mutate(morb_type = if_else(label %in% c("Schiz Bipolar", "Depression", "Learning Disability",
+                                          "Anxiety", "Anorexia", "Mental Psycho",
+                                          "Mental Alcohol", "Dementia"),
+                             "Mental", "Physical")) %>% 
+  select(label, morb_type, unadj_or, unadj_conf_low, unadj_conf_hi, adj_or, adj_conf_low,
+         adj_conf_hi) %>%
+  ggplot(aes(reorder(label, adj_or), adj_or, colour = morb_type)) +
+  geom_hline(yintercept = 1) +
+  geom_point() +
+  geom_errorbar(aes(ymin = adj_conf_low, ymax = adj_conf_hi)) +
+  scale_y_log10(breaks = scales::pretty_breaks()) +
+  scale_colour_manual(values = colours_ckd) +
+  theme(legend.position = "top",
+        text = element_text(size = 16),
+        axis.text.y = element_text(margin = margin(t = 50, b = 50))) +
+  coord_flip() +
+  labs(y = "Odds Ratio with 95% CI\n(log scale)",
+       x = "",
+       title = "Odds ratios for morbidities in relation to CKD status",
+       subtitle = "Adjusted for age, sex, and deprivation",
+       colour = "Morbidity type") -> fig_2
+fig_2
+```
+
+
+```{r, eval=FALSE, echo=FALSE}
+ggsave("plots/fig_2.png", fig_2, width=12, height = 9, dpi = 300)
+```
+
+
+
+## Figure 3
+
+Descriptive look at number of co-morbidities those with CKD diagnosis have.
+
+
+```{r fig.width=9, fig.height=6}
+spice %<>%
+  mutate(age_group = fct_relevel(age_group, "25-34"))
+
+spice %>%
+  group_by(age_group, sex, ckd, all_morbidities) %>% 
+  summarise(total = n()) %>% 
+  mutate(frq = total/sum(total)) %>%
+  filter(ckd == "CKD") %>% 
+  ggplot(aes(age_group, frq, fill = fct_rev(all_morbidities))) + 
+  geom_col() +
+  facet_wrap(~sex) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = scales::pretty_breaks()) +
+  scale_fill_manual(values = colours_ckd, 
+                    guide = guide_legend(reverse = TRUE,
+                                         title = "CKD Comorbidity\ncount",
+                                         title.position = "top",
+                                         title.hjust = 0.5)) +
+  theme(text = element_text(size = 14),
+        axis.text.x = element_text(size = 10),
+        legend.position = "top",
+        panel.spacing = unit(3, "lines")) +
+  labs(x = "Age Group",
+       y = "", 
+       title = "Percentage with specific count of CKD comorbidities",
+       subtitle = "by sex and age group",
+       fill = "",
+       caption = "n = 33,567 with CKD") -> fig_3
+
+fig_3
+```
+
+```{r, eval=FALSE, echo=FALSE}
+ggsave("plots/fig_3.png", fig_3, width=9, height = 6, dpi = 300)
+```
+
+
+
+## Figure 4
+
+Clare, Stewart. From here on in, things are a bit more experimental and we can discuss them in more detail. Text will now be a bit more narrative outlining my personal thoughts on stuff. Obviously this will get tidied up after we agree what to keep. 
+
+One way to show how morbidities cluster with CKD is via an upset plot as shown here....
+
+```{r}
+#Tidy up disease names in original `spice` dataframe
+
+colnames(spice)[14:52] <- snakecase::to_any_case(colnames(spice)[14:52], case = "title") %>% 
+  str_replace(., "Chd", "CHD") %>% 
+  str_replace(., "Pvd", "PVD") %>% 
+  str_replace(., "Tia Stroke", "TIA/Stroke") %>% 
+  str_replace(., "Ibs", "IBS") %>% 
+  str_replace(., "Ms", "MS") 
+
+morbs <- colnames(spice)[14:52]
+
+spice %>% 
+  filter(ckd == "CKD") %>% 
+  mutate_at(vars(Dementia:Pain), function(x) if_else(x == "Yes", 1, 0)) -> ckd_upset
+```
+
+```{r, fig.width=14, fig.height=7}
+#Upset plot
+fig_4 <- upset(ckd_upset, morbs, name = "Morbidities",
+               base_annotations = list(
+                 "Intersection size" = intersection_size(
+                   aes = aes(fill = sex)
+                   counts = TRUE)),
+               width_ratio = 0.1,
+               height_ratio = 1.3, 
+               min_size = 75, 
+               stripes = c("azure1", "gray70"),
+               themes = upset_modify_themes(
+                 list(
+                   "overall_sizes" = theme(axis.text.x = element_text(angle = 90)),
+                   "intersections_matrix" = theme(text = element_text(size = 16))
+                   )
+                )) +
+  labs(title = "Frequency of CKD comorbidity groups",
+       subtitle = "Limited to groups with frequency >= 75",
+       x = "",
+       caption = "n = 33,567 with CKD\nMost frequent 32 combinations shown\nTotal combinations = 13,891") & 
+  scale_fill_manual(values = c("#e53935", "#3949ab"))
+  
+fig_4
+```
+
+```{r, eval=FALSE, echo=FALSE}
+ggsave("plots/fig_4.png", fig_4, width=14, height = 7, dpi = 300)
+```
+
+I think this is interesting, but more for what it doesn't show us. There are almost 14,000 combinations of disease that co-occur with CKD! These are the top 32 and the smallest groups only contain 75 people. It goes to show how highly heterogeneous multimorbidity really is. Incredibly, Heart Failure doesn't show up here despite 4363 of the 33,567 with CKD have it and it has 2nd highest adjusted OR (Table S1). This is partly because those with HF have lots of different combinations of diseases. We can see this point more generally with the next table. 
+
+## Table 3
+
+To try and get a handle on this I've printed out some tables. Whether they will be useful or not is something for us to discuss. They would always be for Supplementary material anyway and we could point to them in the results. It may be a bit too off-piste though?
+
+First confirmation of the number of people with CKD and the number of unique combinations of diseases...
+
+```{r}
+spice %>% 
+  filter(ckd == "CKD") %>% 
+  select(unique_patient_id, age, age_group, sex, carstairs_decile, Dementia:Pain) %>% 
+  pivot_longer(cols = Dementia:Pain, names_to = "diseases", values_to = "present") %>% 
+  group_by(unique_patient_id) %>% 
+  filter(present == "Yes") %>% 
+  select(-present) %>% 
+  mutate(comb = paste0(sort(diseases), collapse = "-"),
+         comb = sort(comb)) %>% 
+  nest(diseases = diseases) %>% 
+  ungroup -> ckd_morb
+
+ckd_morb %>% 
+  summarise(n_total = n_distinct(unique_patient_id),
+            n_combinations = n_distinct(comb))
+```
+
+Now count the number of times these combinations occur. This is just a tabular form of the previous plot with a % score added. I know there is no disclosure control on this data, but is generally good practice not to divulge individual-level data below 5 observations in any table so I lumped these people all together. Incredibly they make up nearly half of all the people with CKD. That is, almost half the people with CKD have a combination of conditions that they share with only 4 other people. 
+
+Funnily enough, if we scroll through we see the first appearance of Heart Failure is on row 33 in combination with CHD. 74 people have that combo!
+
+```{r}
+fct_count(fct_lump_min(ckd_morb$comb, min = 5), sort = TRUE) %>% 
+  mutate(pct = round(n/sum(n) * 100,1)) 
+```
+
+It is possible to isolate any conditions (e.g. Diabetes, CHD, Heart Failure) and filter for rows that only contain these, or just one of these, etc. etc. but it is a never-ending story so haven't gone any further down this path. If you want to look at anything specific then that can be revisited.
+
+## Figure 5
+
+An alternative way to look at things is by plotting a *weighted log odds*. I only came across this method two days ago so need to look into the details a bit more. It was originally used for text analysis where some words occur really frequently compared to others but you want to make a comparison across groups. This translates to everyone having Hypertension in our data which drowns out a lot of other info. 
+
+Best to show the plot first....
+
+```{r, fig.width=12, fig.height=9}
+spice %>% 
+  pivot_longer(cols = Dementia:Pain, names_to = "diseases", values_to = "present") %>% 
+  filter(present == "Yes") -> spice_2
+
+spice_2 %>%
+  count(ckd, diseases, sort = TRUE) %>% 
+  bind_log_odds(ckd, diseases, n) -> ckd_log_odds
+  
+#ckd_log_odds %>% 
+#  arrange(-log_odds_weighted)
+
+ckd_log_odds %>% 
+  filter(ckd == "CKD") %>% 
+  ggplot(aes(n, log_odds_weighted, label = diseases)) +
+  geom_hline(yintercept = 0, colour = "gray50", lty = 2, size = 1) +
+  geom_point(alpha = 0.8, colour = "#4477AA") +
+  geom_text_repel(nudge_y = 0.75) +
+  scale_x_log10(breaks = scales::log_breaks(n = 8), 
+                limits = c(10, 100000),
+                labels = scales::comma_format(accuracy = 1)) +
+  labs(x = "Number of people with CKD who also have each disease (log scale)",
+       y = "Weighted log odds (empirical Bayes)",
+       title = "Which diseases are most specific to those with CKD") -> fig_5
+fig_5
+```
+
+```{r, echo=FALSE, eval=FALSE}
+ggsave("plots/fig_5.png", fig_5, width = 12, height = 9, dpi = 300)
+```
+
+
+What we see here is that, if we weight each disease by how frequently it occurs, we can get an idea of how likely a disease will occur in certain groups. This plot shows that, compared to the overall population, those with CKD are much more likely to have e.g. Heart Failure and less likely to have e.g. pain. This despite Pain being more frequent overall. This makes sense if we think of our normal odds-ratios in table 1. What's nice here is the weighted log-odds for Hypertension is lower than HF, despite its high frequency (and higher OR). This makes sense in that, although lots with CKD have Hypertension, lots of people *without* CKD also have hypertension. This is method shows that that is less true for those with HF. 
+
+## Figure 5a
+
+Another cool thing to do with this method is consider only those with CKD and then look at the weighted log-odds across other groups like deprivation or age group.... The next one is for deprivation.
+
+
+```{r, fig.width=20, fig.height=16}
+spice_2 %>%
+  filter(ckd == "CKD") %>% 
+  count(carstairs_decile, diseases, sort = TRUE) %>% 
+  bind_log_odds(carstairs_decile, diseases, n) -> dep_log_odds
+
+
+dep_log_odds %>% 
+  group_by(carstairs_decile) %>% 
+  top_n(15) %>% 
+  ungroup %>% 
+  mutate(diseases = reorder_within(diseases, log_odds_weighted, carstairs_decile)) %>% 
+  ggplot(aes(log_odds_weighted, diseases, fill = carstairs_decile)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~carstairs_decile, scales = "free_y", ncol = 5,
+             labeller = as_labeller(c(`1` = "1\nmost affluent", `2` = "2", 
+                                    `3` = "3", `4` = "4", `5` = "5", `6` = "6",
+                                    `7` = "7", `8` = "8", `9` = "9",
+                                    `10` = "10\nmost deprived"))) +
+  scale_y_reordered() +
+  scale_fill_manual(values = colours_ckd) +
+  theme(text = element_text(size = 22),
+        axis.text.x = element_text(size = 9),
+        strip.text = element_text(size = 14)) +
+  labs(y = NULL, 
+       x = "Weighted log odds (empirical Bayes)",
+       title = "Most likely conditions co-occuring with CKD",
+       subtitle = "by Deprivation decile") -> fig_5a
+
+fig_5a
+```
+
+
+```{r, echo=FALSE, eval=FALSE}
+ggsave("plots/fig_5a.png", fig_5a, width = 20, height = 16, dpi = 300)
+```
+
+There are some expected candidates over there in decile 10!! I'm still not sure about this method. Am a little put off by the results for Viral Hepatitis in deciles 7 and 5. This fairly overstates the influence, we can see from the last plot roughly 15 people in the whole dataset have this....
+
+
+
+## Figure 6
+
+Clare, you'd mentioned bubble plots. I'm not sure we'll get a decent one. The original Barnett paper did a cross-ref of MM and we can't really replicate that. I tried an age one as you see below, but I don't think it tells us much. Given there isn't a lot of spread by deprivation there's not much to see there either. Have left this as very rough and not saved it. Happy to hear alternative ideas...
+
+```{r}
+ckd_upset %>% 
+  group_by(age_group) %>% 
+  summarise_at(vars(Hypertension, `Heart Failure`, Diabetes, CHD, PVD, `Rheu Arthritis`,
+                    `Atrial Fib`, `TIA/Stroke`), ~sum(.x)) %>% 
+  pivot_longer(cols = Hypertension:`TIA/Stroke`, names_to = "disease", values_to = "n") %>% 
+  group_by(age_group) %>% 
+  mutate(pct = round(n/sum(n) * 100, 1)) %>% 
+  ggplot(aes(age_group, disease, size = pct)) +
+  geom_point()
+```
+
+
+## Figure 7
+
+```{r, fig.width=12, fig.height=9}
+spice %>% 
+  group_by(physical_morbidities, sex, ckd, 
+           fct_other(spice$mental_morbidities, keep = "0", other_level = "More than one")) %>% 
+  summarise(n = n()) %>% 
+  mutate(pct = round(n/sum(n)*100, 1)) %>% 
+  filter(`fct_other(spice$mental_morbidities, keep = "0", other_level = "More than one")`
+         == "More than one") %>% 
+  unite(sex_ckd, sex, ckd, sep = "_") %>%  
+  ggplot(aes(x = physical_morbidities, y = pct)) +
+  geom_point(aes(colour = sex_ckd)) +
+  geom_path(aes(group = sex_ckd, colour = sex_ckd)) +
+  geom_label_repel(aes(label = pct, colour = sex_ckd), 
+                   show.legend = FALSE, nudge_y = 1, nudge_x = 0.1, force = 1.5) +
+  scale_colour_manual(values = colours_ckd,
+                      labels = c("Female with CKD",
+                                   "Female no CKD",
+                                   "Male with CKD",
+                                   "Male no CKD"),
+                      guide = guide_legend(title = "")) +
+  scale_y_continuous(limits = c(0, 70),
+                     breaks = scales::pretty_breaks(),
+                     labels = scales::percent_format(scale = 1)) +
+  labs(title = "Association between number of physical conditions and\npresence of any mental health condition",
+       y = "% of people with at least one mental health condition",
+       x = "Number pf physical health conditions") -> fig_7
+fig_7
+```
+This is a plot similar to some of the other MM papers with this data. It is interesting that those with CKD and at least one other physical condition are slightly less likely to have a mental health diagnosis than their counterparts without CKD. 
+
+I'm not a fan of this visualisation though. To me the lines signify that these groups are connected and they aren't - the percentage values are not associated with other physical health groups and I find that confusing. But that might just be me! Alternative plot below..... We can discuss.
+
+```{r, eval=FALSE, echo=FALSE}
+ggsave("plots/fig_7.png", fig_7, width=12, height = 9, dpi = 300)
+```
+
+
+## Figure 7a
+
+```{r, fig.width=12, fig.height=9}
+spice %>% 
+  group_by(physical_morbidities, sex, ckd, 
+           fct_other(spice$mental_morbidities, keep = "0", other_level = "More than one")) %>% 
+  summarise(n = n()) %>% 
+  mutate(pct = round(n/sum(n)*100, 1)) %>% 
+  filter(`fct_other(spice$mental_morbidities, keep = "0", other_level = "More than one")` 
+         == "More than one") %>% 
+  unite(sex_ckd, sex, ckd, sep = "_") %>%  
+  ggplot(aes(x = physical_morbidities, y = pct)) +
+  geom_col(aes(fill = sex_ckd), position = "dodge") +
+  scale_fill_manual(values = colours_ckd,
+                    labels = c("Female with CKD",
+                               "Female no CKD",
+                               "Male with CKD",
+                               "Male no CKD"),
+                    guide = guide_legend(
+                      title = "")) +
+  scale_y_continuous(limits = c(0, 70),
+                     breaks = scales::pretty_breaks(),
+                     labels = scales::percent_format(scale = 1)) +
+  theme(legend.position = "top") +
+  labs(title = "Association between number of physical conditions and\npresence of any mental health condition",
+       y = "% of people with at least one mental health condition",
+       x = "Number of physical health conditions") -> fig_7a
+fig_7a
+  
+```
+
+
+```{r, eval=FALSE, echo=FALSE}
+ggsave("plots/fig_7a.png", fig_7a, width=12, height = 9, dpi = 300)
+```
+
+# Session Information
+
+```{r}
+devtools::session_info()
+```
+
