@@ -8,6 +8,7 @@ output:
     code_folding: hide
     toc: true
     toc_float: true
+    df_print: paged
 ---
 
 ```{r setup, include=FALSE}
@@ -54,7 +55,7 @@ my_datatable <- function(x){
 }
 
 #Base plotting options
-theme_set(theme_minimal(base_family = "Helvetica 45 Light", base_size = 18) +
+theme_set(theme_minimal(base_family = "Helvetica Neue", base_size = 18) +
             theme(panel.grid.minor = element_blank(),
                   axis.title.y = element_text(margin = margin(0, 20, 0, 0)),
                   axis.title.x = element_text(margin = margin(20, 0, 0, 0))))
@@ -399,7 +400,6 @@ other_mod_all <- left_join(other_mod_uni, other_mod_multi) %>%
 
 #remove intermediary objects
 rm(list = c("other_mod", "other_mod_multi", "other_mod_uni"))
-
 ```
 
 ```{r, echo=FALSE}
